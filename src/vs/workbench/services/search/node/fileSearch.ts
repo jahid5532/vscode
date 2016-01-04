@@ -18,6 +18,12 @@ import extfs = require('vs/base/node/extfs');
 import flow = require('vs/base/node/flow');
 import {ISerializedFileMatch, IRawSearch, ISearchEngine} from 'vs/workbench/services/search/node/rawSearchService';
 
+interface IStat {
+	isDirectory: boolean;
+	isSymbolicLink: boolean;
+	mtime: number;
+}
+
 export class FileWalker {
 
 	private static ENOTDIR = 'ENOTDIR';
@@ -61,7 +67,29 @@ export class FileWalker {
 		this.isCanceled = true;
 	}
 
+	private static statCache: { [path: string]: IStat } = Object.create(null);
+	private static readdirCache: { [path: string]: string[] } = Object.create(null);
+
 	public walk(rootFolders: string[], extraFiles: string[], onResult: (result: ISerializedFileMatch) => void, done: (error: Error, isLimitHit: boolean) => void): void {
+		const statcacheFile = paths.join(rootFolders[0], '.statcache.json');
+		const readdircacheFile = paths.join(rootFolders[0], '.readdircache.json');
+
+		if (fs.existsSync(statcacheFile)) {
+			FileWalker.statCache = JSON.parse(fs.readFileSync(statcacheFile, 'utf8'));
+			FileWalker.readdirCache = JSON.parse(fs.readFileSync(readdircacheFile, 'utf8'));
+		}
+
+		this.walk2(rootFolders, extraFiles, onResult, (error, isLimitHit) => {
+			if (!this.isCanceled) {
+				fs.writeFileSync(statcacheFile, JSON.stringify(FileWalker.statCache));
+				fs.writeFileSync(readdircacheFile, JSON.stringify(FileWalker.readdirCache));
+			}
+
+			done(error, isLimitHit);
+		});
+	}
+
+	private walk2(rootFolders: string[], extraFiles: string[], onResult: (result: ISerializedFileMatch) => void, done: (error: Error, isLimitHit: boolean) => void): void {
 
 		// Reset state
 		this.resetState();
@@ -166,16 +194,16 @@ export class FileWalker {
 
 			// Use lstat to detect links
 			let currentPath = paths.join(absolutePath, file);
-			fs.lstat(currentPath, (error, lstat) => {
+			this.lstatCached(currentPath, (error, iStat) => {
 				if (error || this.isCanceled || this.isLimitHit) {
 					return clb(null);
 				}
 
 				// Directory: Follow directories
-				if (lstat.isDirectory()) {
+				if (iStat.isDirectory) {
 
 					// to really prevent loops with links we need to resolve the real path of them
-					return this.realPathIfNeeded(currentPath, lstat, (error, realpath) => {
+					return this.realPathIfNeeded(currentPath, iStat, (error, realpath) => {
 						if (error || this.isCanceled || this.isLimitHit) {
 							return clb(null);
 						}
@@ -187,7 +215,7 @@ export class FileWalker {
 						this.walkedPaths[realpath] = true; // remember as walked
 
 						// Continue walking
-						return extfs.readdir(currentPath, (error: Error, children: string[]): void => {
+						return this.readdirCached(currentPath, (error: Error, children: string[]): void => {
 							if (error || this.isCanceled || this.isLimitHit) {
 								return clb(null);
 							}
@@ -216,6 +244,67 @@ export class FileWalker {
 
 			return done(error && error.length > 0 ? error[0] : null, null);
 		});
+	}
+
+	private lstatCached(path: string, clb: (error: Error, stat?: IStat) => void): void {
+		const cached = FileWalker.statCache[path];
+
+		// NOT CACHED
+		if (!cached) {
+			// console.log("[CACHE MISS] STAT: " + path);
+
+			return fs.lstat(path, (error, stat) => {
+				const iStat = { isDirectory: stat.isDirectory(), mtime: stat.mtime.getTime(), isSymbolicLink: stat.isSymbolicLink() };
+				FileWalker.statCache[path] = iStat;
+
+				return clb(error, iStat);
+			});
+		}
+
+		// CACHED DIR: needs revalidation
+		if (cached.isDirectory) {
+			// console.log("[CACHE REVAL] STAT FOLDER: " + path);
+
+			return fs.lstat(path, (error, stat) => {
+				if (error || stat.mtime.getTime() !== cached.mtime) {
+					// console.log("[CACHE INVAL] STAT FOLDER: " + path);
+
+					const children = FileWalker.readdirCache[path];
+					if (children) {
+						delete FileWalker.readdirCache[path];
+						children.map(child => paths.join(path, child)).forEach(childPath => delete FileWalker.statCache[childPath]);
+					}
+				}
+
+				const iStat = { isDirectory: stat.isDirectory(), mtime: stat.mtime.getTime(), isSymbolicLink: stat.isSymbolicLink() };
+				FileWalker.statCache[path] = iStat;
+
+				return clb(error, iStat);
+			});
+		}
+
+		// CACHED FILE
+		// console.log("[CACHE HIT] STAT FILE: " + path);
+		return clb(null, cached);
+	}
+
+	private readdirCached(path: string, clb: (error: Error, files: string[]) => void): void  {
+		const cached = FileWalker.readdirCache[path];
+
+		// NOT CACHED
+		if (!cached) {
+			// console.log("[CACHE MISS] READDIR: " + path);
+			return extfs.readdir(path, (error, files) => {
+				FileWalker.readdirCache[path] = files;
+
+				return clb(error, files);
+			});
+		}
+
+		// CACHED
+		// console.log("[CACHE HIT] READDIR: " + path);
+
+		return clb(null, cached);
 	}
 
 	private matchFile(onResult: (result: ISerializedFileMatch) => void, basename: string, absolutePath: string, relativePath: string): void {
@@ -247,8 +336,8 @@ export class FileWalker {
 		return true;
 	}
 
-	private realPathIfNeeded(path: string, lstat: fs.Stats, clb: (error: Error, realpath?: string) => void): void {
-		if (lstat.isSymbolicLink()) {
+	private realPathIfNeeded(path: string, lstat: IStat, clb: (error: Error, realpath?: string) => void): void {
+		if (lstat.isSymbolicLink) {
 			return fs.realpath(path, (error, realpath) => {
 				if (error) {
 					return clb(error);
